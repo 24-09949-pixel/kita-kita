@@ -6,8 +6,8 @@
   const wrap = v => { v.style.maxWidth = '1200px'; v.style.margin = '0 auto'; v.style.width = '100%'; };
   const kv = (a, b) => `<div class="kv"><span>${a}</span><b>${b}</b></div>`;
   const acct = (s, nearest) => `<div class="acct"><div style="display:flex;justify-content:space-between;align-items:center"><b style="color:#fff">My Account</b>${KK.bdg('Active', 'g')}</div><div style="color:#9ca3af;font-size:12px;margin-top:10px">Total outstanding credit</div><div class="big">${peso(s.outstanding)}</div>
-    ${nearest ? `<hr><b style="color:#fff">Credit Details</b>${kv('Transaction', esc(nearest.code))}${kv('Purchase date', KK.fd(nearest.borrowed_on))}${kv('Due date', KK.fd(nearest.due_date))}${kv('Amount paid', peso(nearest.paid))}${kv('Remaining balance', peso(nearest.balance))}<div style="margin-top:6px">${nearest.state === 'overdue' ? KK.bdg('Payment pending', 'y') + ' ' + KK.bdg(`${Math.abs(nearest.days_left)} day${Math.abs(nearest.days_left) === 1 ? '' : 's'} overdue`, 'r') : KK.bdg('Payment pending', 'y') + ' ' + KK.creditBadge(nearest)}</div>` : '<hr><div style="color:#4ade80">✓ You have no unpaid utang. Salamat po!</div>'}
-    <hr><b style="color:#fff">Payment Options</b><div style="padding:6px 0">👛 Cash <span class="tag">— pay at the store counter</span></div><div style="padding:3px 0">📱 E-wallet <span class="tag">— GCash or QR Ph</span></div>${nearest ? `<a class="btn block" href="#/payment?credit_id=${nearest.id}" style="margin-top:12px">Pay Outstanding Balance</a>` : ''}</div>`;
+    ${nearest ? `<hr><b style="color:#fff">Credit Details</b>${kv('Transaction', esc(nearest.code))}${kv('Purchase date', KK.fd(nearest.borrowed_on))}${kv('Due date', KK.fd(nearest.due_date))}${kv('Amount paid', peso(nearest.paid))}${kv('Remaining balance', peso(nearest.balance))}<div style="margin-top:6px">${nearest.payment_status === 'pending_verification' ? KK.bdg(`Pending Verification · ${peso(nearest.pending)}`, 'b') + ' ' : ''}${nearest.state === 'overdue' ? KK.bdg('Payment pending', 'y') + ' ' + KK.bdg(`${Math.abs(nearest.days_left)} day${Math.abs(nearest.days_left) === 1 ? '' : 's'} overdue`, 'r') : KK.creditBadge(nearest)}</div>` : '<hr><div style="color:#4ade80">✓ You have no unpaid utang. Salamat po!</div>'}
+    <hr><b style="color:#fff">Payment Options</b><div style="padding:6px 0">👛 Cash <span class="tag">— pay at the store counter</span></div><div style="padding:3px 0">📱 GCash <span class="tag">— scan the store QR; transfer fees may apply</span></div>${nearest && nearest.balance - nearest.pending > 0.001 ? `<a class="btn block" href="#/payment?credit_id=${nearest.id}" style="margin-top:12px">Submit QR Payment</a>` : ''}</div>`;
 
   R.dashboard = { title: 'Dashboard', roles: ['customer'], render: async v => {
     wrap(v); const s = await api('/portal/summary'), nearest = s.open.slice().sort((a, b) => a.due_date.localeCompare(b.due_date))[0];
@@ -26,30 +26,26 @@
   } };
 
   R.credit = { title: 'My Credit', roles: ['customer'], render: async v => {
-    wrap(v); const [s, credits] = await Promise.all([api('/portal/summary'), api('/portal/credit')]), open = credits.filter(c => c.status === 'open'), nearest = open.slice().sort((a, b) => a.due_date.localeCompare(b.due_date))[0];
     const payable = c => Math.max(0, Math.round((c.balance - c.pending) * 100) / 100);
+    wrap(v); const [s, credits] = await Promise.all([api('/portal/summary'), api('/portal/credit')]), open = credits.filter(c => c.status === 'open'), payableCredits = open.filter(c => payable(c) > 0.001), nearest = open.slice().sort((a, b) => a.due_date.localeCompare(b.due_date))[0];
     v.innerHTML = head('My Credit', 'Outstanding balance, due dates, and credit status') + `<div class="row" style="align-items:flex-start"><div style="flex:0 1 400px;min-width:280px;width:100%">${acct(s, nearest).replace(/<a class="btn block"[^>]*>.*?<\/a>/, '')}</div><div style="flex:1 1 420px;display:flex;flex-direction:column;gap:14px;min-width:0">
     <div class="row">${kpi('Total outstanding', peso(s.outstanding), `${open.length} open credit${open.length === 1 ? '' : 's'}`, 'k-r', 'dn')}${kpi('Credit limit', peso0(s.credit_limit), '')}${kpi('Available credit', peso0(s.available), '', 'k-g')}</div>
-    <div class="card"><h3>Credit Records</h3>${table(['Transaction', 'Purchase date', 'Due date', 'Amount', 'Paid', 'Remaining', 'Status'], credits.map(c => row([`<b>${esc(c.code)}</b>`, KK.fd(c.borrowed_on), KK.fd(c.due_date), peso(c.amount), peso(c.paid), peso(c.balance), (c.status === 'open' ? bdg('Payment pending', 'y') + ' ' : '') + KK.creditBadge(c) + (c.pending > 0 ? ' ' + bdg('₱' + c.pending.toFixed(2) + ' awaiting confirmation', 'b') : '')]), [3, 4, 5]), [3, 4, 5], { cls: 'nowrap-sm', empty: 'No credit records yet.' })}</div>
-    ${open.length ? `<div class="card" id="paybox"><h3>Make a payment</h3><p class="tag">Choose an amount and continue to the separate GCash / QR payment page.</p><a class="btn g block" href="#/payment?credit_id=${nearest.id}" style="margin-top:12px">Pay Outstanding Balance</a></div>` : ''}</div></div>`;
+    <div class="card"><h3>Credit Records</h3>${table(['Transaction', 'Purchase date', 'Due date', 'Amount', 'Paid', 'Remaining', 'Status'], credits.map(c => row([`<b>${esc(c.code)}</b>`, KK.fd(c.borrowed_on), KK.fd(c.due_date), peso(c.amount), peso(c.paid), peso(c.balance), (c.payment_status === 'pending_verification' ? bdg('Pending Verification', 'y') + ' ' : '') + KK.creditBadge(c) + (c.pending > 0 ? '<div class="tag">' + peso(c.pending) + ' awaiting verification</div>' : '')]), [3, 4, 5]), [3, 4, 5], { cls: 'nowrap-sm', empty: 'No credit records yet.' })}</div>
+    ${payableCredits.length ? `<div class="card" id="paybox"><h3>Make a payment</h3><p class="tag">Scan the store's GCash QR, then submit your reference digits and receipt for manual verification.</p><a class="btn g block" href="#/payment?credit_id=${payableCredits[0].id}" style="margin-top:12px">Submit QR Payment</a></div>` : ''}</div></div>`;
   } };
 
-  R.payment = { title: 'Pay by GCash or QR', roles: ['customer'], render: async (v, ctx) => {
+  R.payment = { title: 'Pay by GCash QR', roles: ['customer'], render: async (v, ctx) => {
     wrap(v);
-    const [credits, config] = await Promise.all([api('/portal/credit'), api('/config')]);
+    const credits = await api('/portal/credit');
     const open = credits.filter(c => c.status === 'open' && c.balance - c.pending > 0.001), selected = open.find(c => c.id === Number(ctx.params.get('credit_id'))) || open[0];
-    const returned = ctx.params.get('payment');
-    let statusNote = returned === 'returned'
-      ? '<div class="note grn">Returned from checkout. Your balance will change only after PayMongo confirms the payment.</div>'
-      : returned === 'cancelled' ? '<div class="note">Payment was cancelled. No balance change was recorded.</div>' : '';
-    v.innerHTML = head('Pay with GCash or QR', 'Choose how to pay this specific amount') + `<a href="#/credit">‹ Back to My Credit</a>${statusNote}
-      ${!open.length ? '<div class="card empty">No unpaid balance is currently available to pay.</div>' : !config.payment_gateway ? '<div class="card"><h3>Online payments are not configured</h3><p class="tag">Set the PayMongo secret key and webhook secret on the server to enable amount-specific GCash and QR Ph payments.</p></div>' : `<div class="card" style="max-width:680px"><form id="payform">${field('Which utang?', 'credit_id', selected.id, { select: open.map(c => [c.id, `${c.code} · ${peso(Math.max(0, c.balance - c.pending))} available · due ${KK.fd(c.due_date)}`]) })}
-      <label class="lab">Payment option</label><input type="hidden" name="gateway_method" value="gcash"><div class="row" id="methods">
-      <button class="opt on" type="button" data-method="gcash"><b>📱 Open GCash app</b><div class="tag" style="margin-top:5px">Continue securely; PayMongo will open the GCash payment flow.</div></button>
-      <button class="opt" type="button" data-method="qrph"><b>▦ Scan a QR code</b><div class="tag" style="margin-top:5px">PayMongo shows a QR Ph code for the exact amount. Scan it with GCash or another supported wallet.</div></button></div>
-      <div style="margin-top:14px"><label class="lab" for="amount">Amount to pay (₱)</label><input class="inp" id="amount" name="amount" type="number" min="0.01" max="${Math.max(0, selected.balance - selected.pending).toFixed(2)}" step="0.01" value="${Math.max(0, selected.balance - selected.pending).toFixed(2)}" required></div>
-      <div class="note grn" style="margin-top:12px">The gateway checkout is tied to this amount and credit record. Do not pay a different amount.</div>
-      <button class="btn g block" type="submit" style="margin-top:14px">Continue to GCash</button></form></div>`}`;
+    v.innerHTML = head('Pay with GCash QR', 'Send the payment yourself, then upload the receipt for the store to verify') + `<a href="#/credit">‹ Back to My Credit</a>
+      ${!open.length ? '<div class="card empty">No balance is currently available for a new payment. Any submitted proof is pending verification.</div>' : `<div class="row" style="align-items:flex-start;margin-top:12px"><div class="card" style="flex:0 1 360px;text-align:center"><h3>Scan to pay</h3><img class="payment-qr" src="/images/gcash-payment-qr.png" alt="Store GCash QR code"><p class="tag">Enter the payment amount shown here in your GCash app. Transfer fees may apply.</p><div class="note" style="margin-top:12px">Your balance changes only after the store checks its account and confirms your payment.</div></div>
+      <div class="card" style="flex:1 1 420px;min-width:280px"><h3>Submit Payment Proof</h3><form id="payform">${field('Which utang?', 'credit_id', selected.id, { select: open.map(c => [c.id, `${c.code} · ${peso(Math.max(0, c.balance - c.pending))} available · due ${KK.fd(c.due_date)}`]) })}
+      <div style="margin-top:12px"><label class="lab" for="amount">Amount sent (₱)</label><input class="inp" id="amount" name="amount" type="number" min="0.01" max="${Math.max(0, selected.balance - selected.pending).toFixed(2)}" step="0.01" value="${Math.max(0, selected.balance - selected.pending).toFixed(2)}" required></div>
+      <div style="margin-top:12px"><label class="lab" for="reference_last4">Last 4 digits of the reference number</label><input class="inp" id="reference_last4" name="reference_last4" type="text" inputmode="numeric" maxlength="4" pattern="\\d{4}" autocomplete="off" required></div>
+      <div style="margin-top:12px"><label class="lab" for="receipt">Screenshot of receipt</label><input class="inp" id="receipt" name="receipt" type="file" accept="image/jpeg,image/png,image/webp" required><div class="tag">JPEG, PNG, or WebP · 4 MB maximum</div></div>
+      ${selected.pending > 0 ? `<div class="note" style="margin-top:12px">${peso(selected.pending)} is already pending verification for this utang.</div>` : ''}
+      <button class="btn g block" type="submit" style="margin-top:14px">Submit Payment Proof</button></form></div></div>`}`;
     const form = $('#payform', v); if (!form) return;
     const amount = $('#amount', form), setAmount = () => {
       const credit = open.find(c => c.id === Number(form.credit_id.value));
@@ -57,17 +53,19 @@
       amount.value = amount.max;
     };
     form.credit_id.onchange = setAmount;
-    $$('.opt', form).forEach(option => option.onclick = () => {
-      $$('.opt', form).forEach(item => item.classList.toggle('on', item === option));
-      form.gateway_method.value = option.dataset.method;
-      $('button[type="submit"]', form).textContent = option.dataset.method === 'qrph' ? 'Continue to QR checkout' : 'Continue to GCash';
-    });
     KK.submit(form, async d => {
-      const result = await api('/portal/pay', { method: 'POST', body: {
-        credit_id: Number(d.credit_id), amount: Number(d.amount), method: 'ewallet', gateway_method: d.gateway_method,
+      if (!(d.receipt instanceof File) || !d.receipt.size) throw new Error('Choose a receipt screenshot to upload.');
+      if (d.receipt.size > 4 * 1024 * 1024) throw new Error('Receipt image must be 4 MB or smaller.');
+      const receiptImage = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => reject(new Error('Could not read the receipt image.'));
+        reader.readAsDataURL(d.receipt);
+      });
+      const result = await api('/portal/payment-proofs', { method: 'POST', body: {
+        credit_id: Number(d.credit_id), amount: Number(d.amount), reference_last4: d.reference_last4, receipt_image: receiptImage,
       } });
-      if (!result.checkout_url) throw new Error('The payment gateway did not return a checkout link.');
-      window.location.assign(result.checkout_url);
+      KK.toast(result.message, 'ok'); KK.route();
     });
   } };
 
@@ -94,6 +92,6 @@
   R.payments = { title: 'Payments', roles: ['customer'], render: async v => {
     wrap(v); const [p, s] = await Promise.all([api('/portal/payments'), api('/portal/summary')]), last = p.items.find(x => x.status === 'confirmed');
     v.innerHTML = head('Payments', 'Recorded payments and payment history') + `<div class="row">${kpi('Total paid (lifetime)', peso(p.total_paid), `${p.items.filter(x => x.status === 'confirmed').length} payments`, 'k-g')}${kpi('Pending balance', peso(s.outstanding), s.next_due ? 'Next due ' + KK.fd(s.next_due) : 'Nothing due', s.outstanding > 0 ? 'k-r' : '', s.outstanding > 0 ? 'dn' : '')}${kpi('Last payment', last ? peso(last.amount) : '—', last ? KK.fd(last.created_at) + ' · ' + (last.method === 'ewallet' ? 'E-wallet' : 'Cash') : '')}</div>
-    <div class="card"><h3>Payment History <span class="sub">Recorded by the store</span></h3>${table(['Date', 'Applied to', 'Method', 'Reference', 'Amount', 'Recorded by', 'Status'], p.items.map(x => row([KK.fdt(x.created_at), esc(x.code), x.paymongo_method_type === 'gcash' ? 'GCash' : x.paymongo_method_type === 'qrph' ? 'QR Ph' : x.method === 'ewallet' ? 'E-wallet' : 'Cash', x.provider === 'paymongo' && x.status === 'pending' && x.paymongo_checkout_url && x.paymongo_checkout_url.startsWith('https://checkout.paymongo.com/') ? `<a href="${esc(x.paymongo_checkout_url)}" target="_blank" rel="noopener noreferrer">Continue checkout</a>` : esc(x.reference || '—'), `<b>${peso(x.amount)}</b>`, esc(x.recorded_by_name || (x.status === 'pending' ? 'Awaiting confirmation' : 'Portal')), x.status === 'confirmed' ? bdg('Confirmed', 'g') : x.status === 'pending' ? bdg('Pending', 'y') : bdg('Rejected', 'r')]), [4]), [4], { cls: 'nowrap-sm', empty: 'No payments yet.' })}${s.outstanding > 0 ? '<div class="note" style="margin-top:12px">You still have a balance. Go to <a href="#/credit"><b>My Credit</b></a> to pay by cash or e-wallet.</div>' : ''}</div>`;
+    <div class="card"><h3>Payment History <span class="sub">Recorded by the store</span></h3>${table(['Date', 'Applied to', 'Method', 'Reference (last 4)', 'Amount', 'Verified at', 'Status'], p.items.map(x => row([KK.fdt(x.created_at), esc(x.code), x.method === 'ewallet' ? 'GCash / e-wallet' : 'Cash', esc(x.reference_last4 || x.reference || '—'), `<b>${peso(x.amount)}</b>`, x.confirmed_at ? KK.fdt(x.confirmed_at) : '—', x.status === 'confirmed' ? bdg('Confirmed', 'g') : x.status === 'pending' ? bdg(x.provider === 'manual_qr' ? 'Pending Verification' : 'Pending', 'y') : bdg('Rejected', 'r')]), [4]), [4], { cls: 'nowrap-sm', empty: 'No payments yet.' })}${s.outstanding > 0 ? '<div class="note" style="margin-top:12px">You still have a balance. Go to <a href="#/credit"><b>My Credit</b></a> to submit proof with the store QR or pay at the counter.</div>' : ''}</div>`;
   } };
 })();

@@ -1,6 +1,6 @@
 'use strict';
 // End-to-end API tests. Run: npm test
-const fs = require('fs'), os = require('os'), path = require('path'), assert = require('assert'), crypto = require('crypto');
+const fs = require('fs'), os = require('os'), path = require('path'), assert = require('assert');
 const { open, ymd, addDays } = require('../db');
 const { seed } = require('../seed');
 const { createApp } = require('../server');
@@ -14,16 +14,6 @@ const server = createApp(db, { secret: 'test' }).listen(0);
 const base = `http://127.0.0.1:${server.address().port}`;
 const setupDb = open(setupFile), setupServer = createApp(setupDb, { secret: 'setup-test' }).listen(0);
 const setupBase = `http://127.0.0.1:${setupServer.address().port}`;
-let gatewayRequest, gatewaySessionId, gatewayCounter = 0;
-const gatewayServer = createApp(db, {
-  secret: 'test', paymongoSecretKey: 'sk_test_mock', paymongoWebhookSecret: 'whsec_mock', publicUrl: 'https://kitakita.example',
-  fetch: async (url, options) => {
-    gatewayRequest = { url, options, body: JSON.parse(options.body) };
-    gatewaySessionId = `cs_test_mock_${++gatewayCounter}`;
-    return new Response(JSON.stringify({ data: { id: gatewaySessionId, attributes: { checkout_url: 'https://checkout.paymongo.com/mock' } } }), { status: 200, headers: { 'Content-Type': 'application/json' } });
-  },
-}).listen(0);
-const gatewayBase = `http://127.0.0.1:${gatewayServer.address().port}`;
 let pass = 0, failed = 0;
 
 async function call(method, url, body, token) {
@@ -217,59 +207,53 @@ const tomorrow = ymd(addDays(new Date(), 1)), nextWeek = ymd(addDays(new Date(),
     assert.strictEqual((await post(`/api/credit-requests/${r2.data.id}/decline`, { note: 'Pay old balance first' }, admin)).data.status, 'declined');
     assert.ok((await get('/api/portal/summary', cust)).data.notifications.some(n => /approved/.test(n.title)));
   });
-  await t('e-wallet payment is pending until staff confirm; cash pay is informational; limits enforced', async () => {
-    const credits = (await get('/api/portal/credit', cust)).data.filter(c => c.status === 'open'); const c = credits[0]; assert.ok(c);
-    assert.strictEqual((await post('/api/portal/pay', { credit_id: c.id, amount: c.balance + 50, method: 'ewallet', reference: 'GC-9999' }, cust)).status, 400);
-    assert.strictEqual((await post('/api/portal/pay', { credit_id: c.id, amount: 10, method: 'ewallet' }, cust)).status, 400);
-    assert.strictEqual((await post('/api/portal/pay', { credit_id: c.id, amount: 10, method: 'cash' }, cust)).data.ok, true);
-    const r = await post('/api/portal/pay', { credit_id: c.id, amount: 10, method: 'ewallet', reference: 'GC-9999' }, cust); assert.strictEqual(r.status, 201);
-    assert.strictEqual((await get('/api/credits?status=open', admin)).data.items.find(x => x.id === c.id).paid, c.paid); // unchanged while pending
-    const pend = (await get('/api/payments?status=pending', cashier)).data; assert.ok(pend.length >= 1);
-    const ok = await post(`/api/payments/${r.data.payment.id}/confirm`, {}, cashier); assert.strictEqual(ok.data.status, 'confirmed');
-    assert.strictEqual((await get('/api/credits?status=open', admin)).data.items.find(x => x.id === c.id).paid, c.paid + 10);
-    assert.strictEqual((await post(`/api/payments/${r.data.payment.id}/confirm`, {}, cashier)).status, 400);
-    const r2 = await post('/api/portal/pay', { credit_id: c.id, amount: 5, method: 'ewallet', reference: 'GC-1111' }, cust);
-    assert.strictEqual((await post(`/api/payments/${r2.data.payment.id}/reject`, {}, cashier)).data.status, 'rejected');
-    const hist = (await get('/api/portal/payments', cust)).data; assert.ok(hist.items.length >= 2 && hist.total_paid >= 10);
-  });
-  await t('PayMongo creates GCash or amount-specific QR checkout and only a signed webhook confirms payment', async () => {
+  await t('manual QR proof validates uploads, stays pending, and is admin-confirmed or rejected', async () => {
     const credits = (await get('/api/portal/credit', cust)).data.filter(c => c.status === 'open'), c = credits[0]; assert.ok(c);
-    const response = await fetch(gatewayBase + '/api/portal/pay', {
-      method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + cust },
-      body: JSON.stringify({ credit_id: c.id, amount: 10, method: 'ewallet', gateway_method: 'gcash' }),
-    });
-    const checkout = await response.json(); assert.strictEqual(response.status, 201, JSON.stringify(checkout));
-    assert.strictEqual(checkout.checkout_url, 'https://checkout.paymongo.com/mock');
-    assert.strictEqual(gatewayRequest.url, 'https://api.paymongo.com/v2/checkout_sessions');
-    assert.deepStrictEqual(gatewayRequest.body.data.attributes.payment_method_types, ['gcash']);
-    assert.strictEqual(gatewayRequest.body.data.attributes.line_items[0].amount, 1000);
-    assert.ok(gatewayRequest.options.headers['Idempotency-Key'].startsWith('KK-PAY-'));
-    assert.strictEqual((await post(`/api/payments/${checkout.payment.id}/confirm`, {}, cashier)).status, 400);
+    const receiptImage = 'data:image/png;base64,iVBORw0KGgo=';
+    const submit = (body = {}) => post('/api/portal/payment-proofs', { credit_id: c.id, amount: 10, reference_last4: '9999', receipt_image: receiptImage, ...body }, cust);
+    assert.strictEqual((await submit({ reference_last4: '123' })).status, 400);
+    assert.strictEqual((await submit({ reference_last4: '12345' })).status, 400);
+    assert.strictEqual((await submit({ reference_last4: '12x4' })).status, 400);
+    assert.strictEqual((await submit({ receipt_image: 'data:image/jpeg;base64,iVBORw0KGgo=' })).status, 400);
+    assert.strictEqual((await submit({ receipt_image: undefined })).status, 400);
+    assert.strictEqual((await submit({ receipt_image: 'data:image/png;base64,' + 'A'.repeat(5592408) })).status, 400);
+    assert.strictEqual((await submit({ amount: c.balance + 50 })).status, 400);
 
-    const makeEvent = (id) => ({
-      data: { id, attributes: { type: 'checkout_session.payment.paid', livemode: false, data: {
-        id: gatewaySessionId, attributes: { payments: [{ id: 'pay_test_mock', attributes: { status: 'paid', currency: 'PHP', amount: 1000, net_amount: 1000 } }] },
-      } } },
-    });
-    const timestamp = '1790000000', payload = makeEvent('evt_test_mock'), raw = JSON.stringify(payload);
-    const signature = crypto.createHmac('sha256', 'whsec_mock').update(`${timestamp}.${raw}`).digest('hex');
-    const sendWebhook = sig => fetch(gatewayBase + '/webhooks/paymongo', {
-      method: 'POST', headers: { 'Content-Type': 'application/json', 'Paymongo-Signature': `t=${timestamp},te=${sig},li=` }, body: raw,
-    });
-    assert.strictEqual((await sendWebhook('0'.repeat(64))).status, 401);
-    assert.strictEqual((await sendWebhook(signature)).status, 200);
-    const paid = (await get('/api/portal/credit', cust)).data.find(x => x.id === c.id);
-    assert.strictEqual(paid.paid, c.paid + 10);
-    assert.strictEqual((await sendWebhook(signature)).status, 200);
-    assert.strictEqual((await get('/api/portal/credit', cust)).data.find(x => x.id === c.id).paid, c.paid + 10);
+    const before = (await get('/api/credits?status=open', admin)).data.items.find(x => x.id === c.id).paid;
+    const r = await submit(); assert.strictEqual(r.status, 201, JSON.stringify(r.data));
+    const id = r.data.payment.id; assert.strictEqual(r.data.payment.status, 'pending');
+    assert.strictEqual('receipt_image' in r.data.payment, false);
+    const pendingCredit = (await get('/api/portal/credit', cust)).data.find(x => x.id === c.id);
+    assert.strictEqual(pendingCredit.pending, 10); assert.strictEqual(pendingCredit.payment_status, 'pending_verification');
+    assert.strictEqual((await get('/api/portal/credit', cust)).data.find(x => x.id === c.id).paid, before);
+    assert.ok((await get('/api/portal/summary', cust)).data.notifications.some(n => /proof awaiting verification/.test(n.title)));
+    assert.ok((await get('/api/alerts', admin)).data.pending_payments >= 1);
+    assert.strictEqual((await get('/api/payments/proofs', cashier)).status, 403);
+    assert.strictEqual((await get(`/api/payments/${id}/receipt`, cust)).status, 403);
+    assert.strictEqual((await get(`/api/payments/${id}/receipt`, cashier)).status, 403);
+    assert.strictEqual((await post(`/api/payments/${id}/confirm`, {}, cashier)).status, 403);
+    assert.strictEqual((await post(`/api/payments/${id}/reject`, {}, cashier)).status, 403);
 
-    const qrResponse = await fetch(gatewayBase + '/api/portal/pay', {
-      method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + cust },
-      body: JSON.stringify({ credit_id: c.id, amount: 1, method: 'ewallet', gateway_method: 'qrph' }),
-    });
-    const qr = await qrResponse.json(); assert.strictEqual(qrResponse.status, 201, JSON.stringify(qr));
-    assert.deepStrictEqual(gatewayRequest.body.data.attributes.payment_method_types, ['qrph']);
-    assert.strictEqual(qr.payment.paymongo_method_type, 'qrph');
+    const proofs = await get('/api/payments/proofs', admin);
+    assert.ok(proofs.data.some(p => p.id === id && p.balance_due === c.balance));
+    assert.strictEqual('receipt_image' in proofs.data.find(p => p.id === id), false);
+    const receipt = await fetch(base + `/api/payments/${id}/receipt`, { headers: { Authorization: 'Bearer ' + admin } });
+    assert.strictEqual(receipt.status, 200); assert.strictEqual(receipt.headers.get('content-type'), 'image/png');
+    assert.deepStrictEqual(Buffer.from(await receipt.arrayBuffer()), Buffer.from('iVBORw0KGgo=', 'base64'));
+
+    const confirmed = await post(`/api/payments/${id}/confirm`, {}, admin);
+    assert.strictEqual(confirmed.data.status, 'confirmed'); assert.ok(confirmed.data.confirmed_at);
+    assert.strictEqual((await get('/api/credits?status=open', admin)).data.items.find(x => x.id === c.id).paid, before + 10);
+    assert.strictEqual((await post(`/api/payments/${id}/confirm`, {}, admin)).status, 400);
+    const rejected = await submit({ amount: 5, reference_last4: '1111' });
+    assert.strictEqual(rejected.status, 201);
+    const rejectedAt = await post(`/api/payments/${rejected.data.payment.id}/reject`, {}, admin);
+    assert.strictEqual(rejectedAt.data.status, 'rejected'); assert.strictEqual(rejectedAt.data.confirmed_at, null);
+    assert.strictEqual((await get('/api/credits?status=open', admin)).data.items.find(x => x.id === c.id).paid, before + 10);
+    const history = (await get('/api/portal/payments', cust)).data;
+    assert.ok(history.items.some(x => x.id === id && x.confirmed_at));
+    assert.strictEqual(history.items.some(x => 'receipt_image' in x), false);
+    assert.strictEqual((await post('/api/portal/pay', { credit_id: c.id, amount: 1, method: 'ewallet' }, cust)).status, 404);
   });
   await t("customers can't read other customers' receipts", async () => {
     assert.strictEqual((await get(`/api/portal/purchases/${utangSale.id}`, cust)).status, 404);
@@ -334,14 +318,18 @@ const tomorrow = ymd(addDays(new Date(), 1)), nextWeek = ymd(addDays(new Date(),
     const bad = await fetch(base + '/api/sales', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + admin }, body: '{oops' }); assert.strictEqual(bad.status, 400);
     assert.strictEqual((await get('/api/nope', admin)).status, 404);
   });
-  await t('static front end is served with security headers', async () => { const r = await fetch(base + '/'); assert.strictEqual(r.status, 200); assert.ok(r.headers.get('content-security-policy')); });
+  await t('static front end and store QR image are served with security headers', async () => {
+    const r = await fetch(base + '/'); assert.strictEqual(r.status, 200); assert.ok(r.headers.get('content-security-policy'));
+    const qr = await fetch(base + '/images/gcash-payment-qr.png'); assert.strictEqual(qr.status, 200);
+    assert.ok((qr.headers.get('content-type') || '').startsWith('image/png')); assert.ok((await qr.arrayBuffer()).byteLength > 0);
+  });
   await t('data integrity: stock never negative, credit paid <= amount', async () => {
     assert.strictEqual(db.prepare('SELECT COUNT(*) n FROM products WHERE stock<0').get().n, 0); assert.strictEqual(db.prepare('SELECT COUNT(*) n FROM credits WHERE paid>amount+0.001 OR paid<0').get().n, 0);
     assert.strictEqual(db.prepare("SELECT COUNT(*) n FROM credits WHERE status='paid' AND paid<amount-0.001").get().n, 0);
   });
 
   console.log(`\n${pass} passed, ${failed} failed`);
-  server.close(); setupServer.close(); gatewayServer.close(); db.close(); setupDb.close();
+  server.close(); setupServer.close(); db.close(); setupDb.close();
   for (const s of ['', '-wal', '-shm']) try { fs.unlinkSync(file + s); } catch {}
   for (const s of ['', '-wal', '-shm']) try { fs.unlinkSync(setupFile + s); } catch {}
   process.exit(failed ? 1 : 0);

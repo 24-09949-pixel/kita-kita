@@ -3,7 +3,6 @@ const path = require('path');
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const crypto = require('crypto');
 const { open, ymd, ymdhms, addDays, parseYmd, round2 } = require('./db');
 
 class HttpError extends Error { constructor(status, msg) { super(msg); this.status = status; } }
@@ -13,6 +12,20 @@ const validDate = s => typeof s === 'string' && DATE_RE.test(s) && ymd(parseYmd(
 const dayDiff = (a, b) => Math.round((parseYmd(a) - parseYmd(b)) / 864e5); // a - b in days
 const digits = s => String(s || '').replace(/\D/g, '');
 const str = (v, max = 200) => (typeof v === 'string' ? v.trim().slice(0, max) : '');
+const MAX_RECEIPT_BYTES = 4 * 1024 * 1024;
+function parseReceiptImage(dataUrl) {
+  if (typeof dataUrl !== 'string' || dataUrl.length > 6 * 1024 * 1024) throw bad('Receipt image is required and must be 4 MB or smaller');
+  const match = /^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/]+={0,2})$/.exec(dataUrl);
+  if (!match || match[2].length % 4 !== 0) throw bad('Upload a JPEG, PNG, or WebP receipt image');
+  const image = Buffer.from(match[2], 'base64');
+  if (!image.length || image.length > MAX_RECEIPT_BYTES || image.toString('base64') !== match[2]) throw bad('Receipt image must be 4 MB or smaller');
+  const mime = match[1], isPng = image.subarray(0, 8).equals(Buffer.from('89504e470d0a1a0a', 'hex'));
+  const isJpeg = image.length >= 3 && image[0] === 0xff && image[1] === 0xd8 && image[2] === 0xff;
+  const isWebp = image.length >= 12 && image.toString('ascii', 0, 4) === 'RIFF' && image.toString('ascii', 8, 12) === 'WEBP';
+  if ((mime === 'image/png' && !isPng) || (mime === 'image/jpeg' && !isJpeg) || (mime === 'image/webp' && !isWebp))
+    throw bad('Receipt file content does not match its image type');
+  return { image, mime };
+}
 function num(v, label, { min = -Infinity, max = Infinity, int = false, req = true } = {}) {
   if (v === undefined || v === null || v === '') { if (req) throw bad(`${label} is required`); return undefined; }
   const n = Number(v);
@@ -33,14 +46,6 @@ function csv(rows, cols) {
 function createApp(db, opts = {}) {
   const SECRET = opts.secret || process.env.JWT_SECRET || (process.env.NODE_ENV === 'production' ? '' : 'kitakita-dev-secret-change-me');
   if (!SECRET) throw new Error('JWT_SECRET must be set in production');
-  const paymongoSecretKey = opts.paymongoSecretKey === undefined ? process.env.PAYMONGO_SECRET_KEY || '' : opts.paymongoSecretKey;
-  const paymongoWebhookSecret = opts.paymongoWebhookSecret === undefined ? process.env.PAYMONGO_WEBHOOK_SECRET || '' : opts.paymongoWebhookSecret;
-  if (!!paymongoSecretKey !== !!paymongoWebhookSecret) throw new Error('Set both PAYMONGO_SECRET_KEY and PAYMONGO_WEBHOOK_SECRET, or leave both unset');
-  if (paymongoSecretKey && !/^sk_(test|live)_/.test(paymongoSecretKey)) throw new Error('PAYMONGO_SECRET_KEY must be a PayMongo test or live secret key');
-  const paymongoConfigured = !!paymongoSecretKey;
-  const paymongoLiveMode = paymongoSecretKey.startsWith('sk_live_');
-  const publicUrl = opts.publicUrl || process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || '';
-  const fetcher = opts.fetch || globalThis.fetch;
   const app = express();
   app.disable('x-powered-by');
   app.use((req, res, next) => {
@@ -48,9 +53,8 @@ function createApp(db, opts = {}) {
       'Content-Security-Policy': "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; script-src 'self'; frame-ancestors 'none'" });
     next();
   });
-  app.use(express.json({ limit: '100kb', verify: (req, res, buf) => {
-    if (req.originalUrl.split('?')[0] === '/webhooks/paymongo') req.rawBody = Buffer.from(buf);
-  } }));
+  app.use('/api/portal/payment-proofs', express.json({ limit: '6mb' }));
+  app.use(express.json({ limit: '100kb' }));
   const today = () => ymd();
   const q = (sql, ...p) => db.prepare(sql).all(...p);
   const one = (sql, ...p) => db.prepare(sql).get(...p);
@@ -134,58 +138,7 @@ function createApp(db, opts = {}) {
   });
 
   app.get('/api/health', (req, res) => { one('SELECT 1'); res.json({ ok: true }); });
-  app.get('/api/config', (req, res) => res.json({ setup_required: !one('SELECT 1 FROM users LIMIT 1'), payment_gateway: paymongoConfigured, store: { name: process.env.STORE_NAME || 'Kita Kita Store', address: process.env.STORE_ADDRESS || '', phone: process.env.STORE_PHONE || '' } }));
-
-  app.post('/webhooks/paymongo', (req, res) => {
-    if (!paymongoConfigured) throw new HttpError(503, 'Payment gateway webhook is not configured');
-    const rawBody = req.rawBody;
-    const signatureHeader = req.get('Paymongo-Signature') || '';
-    const signatureParts = Object.fromEntries(signatureHeader.split(',').map(part => {
-      const i = part.indexOf('=');
-      return i < 0 ? ['', ''] : [part.slice(0, i).trim(), part.slice(i + 1).trim()];
-    }).filter(([key]) => key));
-    const timestamp = signatureParts.t || '';
-    const signature = signatureParts[paymongoLiveMode ? 'li' : 'te'] || '';
-    if (!rawBody || !/^\d+$/.test(timestamp) || !/^[a-f0-9]{64}$/i.test(signature)) throw new HttpError(401, 'Invalid payment signature');
-    const expected = crypto.createHmac('sha256', paymongoWebhookSecret).update(`${timestamp}.${rawBody.toString('utf8')}`).digest();
-    const received = Buffer.from(signature, 'hex');
-    if (received.length !== expected.length || !crypto.timingSafeEqual(received, expected)) throw new HttpError(401, 'Invalid payment signature');
-
-    const envelope = req.body && req.body.data;
-    const attributes = envelope && envelope.attributes || {};
-    const eventType = attributes.type || envelope && envelope.type;
-    if (eventType !== 'checkout_session.payment.paid') return res.json({ ok: true });
-    const session = attributes.data || envelope && envelope.data;
-    const eventId = envelope && envelope.id;
-    const eventLiveMode = typeof attributes.livemode === 'boolean' ? attributes.livemode : envelope && envelope.livemode;
-    if (!eventId || !session || typeof eventLiveMode !== 'boolean') throw bad('Invalid payment event');
-    if (eventLiveMode !== paymongoLiveMode) return res.json({ ok: true });
-
-    const sessionAttributes = session.attributes || {};
-    const paidPayment = (sessionAttributes.payments || []).find(payment => payment.attributes && payment.attributes.status === 'paid');
-    if (!session.id || !paidPayment) throw bad('Paid checkout details are missing');
-    const paidAttributes = paidPayment.attributes;
-    if (paidAttributes.currency !== 'PHP') throw bad('Unexpected payment currency');
-    const paidAmount = paidAttributes.net_amount ?? paidAttributes.amount;
-    if (!Number.isInteger(paidAmount) || paidAmount <= 0) throw bad('Invalid paid amount');
-
-    db.transaction(() => {
-      if (one('SELECT 1 FROM paymongo_webhook_events WHERE event_id=?', eventId)) return;
-      const payment = one('SELECT * FROM payments WHERE paymongo_checkout_session_id=?', session.id);
-      if (!payment) throw new HttpError(404, 'Payment for checkout session not found');
-      if (payment.status === 'pending') {
-        const credit = one("SELECT * FROM credits WHERE id=? AND customer_id=? AND status='open'", payment.credit_id, payment.customer_id);
-        const remaining = credit ? round2(credit.amount - credit.paid) : 0;
-        if (!credit || payment.amount > remaining + 0.001 || Math.round(payment.amount * 100) !== paidAmount)
-          throw new HttpError(409, 'Paid checkout does not match the outstanding balance');
-        const newPaid = round2(credit.paid + payment.amount);
-        run('UPDATE credits SET paid=?, status=? WHERE id=?', newPaid, newPaid >= credit.amount - 0.001 ? 'paid' : 'open', credit.id);
-        run("UPDATE payments SET status='confirmed', reference=? WHERE id=?", `PayMongo ${str(paidPayment.id, 40)}`, payment.id);
-      }
-      run('INSERT INTO paymongo_webhook_events(event_id,received_at) VALUES(?,?)', eventId, ymdhms());
-    })();
-    res.json({ ok: true });
-  });
+  app.get('/api/config', (req, res) => res.json({ setup_required: !one('SELECT 1 FROM users LIMIT 1'), store: { name: process.env.STORE_NAME || 'Kita Kita Store', address: process.env.STORE_ADDRESS || '', phone: process.env.STORE_PHONE || '' } }));
 
   // ---------- products ----------
   const pStatus = p => (p.stock === 0 ? 'out' : p.stock <= p.reorder_level ? 'low' : 'in');
@@ -250,7 +203,7 @@ function createApp(db, opts = {}) {
 
   // ---------- customers & credit helpers ----------
   const creditView = c => { const bal = round2(c.amount - c.paid); const dl = dayDiff(c.due_date, today());
-    return { ...c, balance: bal, days_left: dl, state: c.status === 'paid' ? 'paid' : c.status === 'void' ? 'void' : dl < 0 ? 'overdue' : dl <= 7 ? 'due_soon' : 'current' }; };
+    return { ...c, balance: bal, days_left: dl, payment_status: Number(c.pending) > 0 ? 'pending_verification' : c.status, state: c.status === 'paid' ? 'paid' : c.status === 'void' ? 'void' : dl < 0 ? 'overdue' : dl <= 7 ? 'due_soon' : 'current' }; };
   const balanceOf = cid => round2(one("SELECT COALESCE(SUM(amount-paid),0) b FROM credits WHERE customer_id=? AND status='open'", cid).b);
   const CUST_SQL = `SELECT c.*, COALESCE(b.bal,0) balance, b.next_due, COALESCE(b.overdue,0) overdue,
     (SELECT MAX(created_at) FROM sales WHERE customer_id=c.id AND status='completed') last_purchase,
@@ -284,8 +237,8 @@ function createApp(db, opts = {}) {
   });
   app.get('/api/customers/:id', staff, (req, res) => {
     const c = one(`${CUST_SQL} WHERE c.id=? AND c.active=1`, today(), req.params.id); if (!c) throw new HttpError(404, 'Customer not found');
-    const credits = q('SELECT cr.*, s.code FROM credits cr LEFT JOIN sales s ON s.id=cr.sale_id WHERE cr.customer_id=? ORDER BY cr.borrowed_on DESC, cr.id DESC', c.id).map(creditView);
-    const payments = q("SELECT p.*, COALESCE(s.code,'CR-'||cr.id) code, u.name recorded_by_name FROM payments p JOIN credits cr ON cr.id=p.credit_id LEFT JOIN sales s ON s.id=cr.sale_id LEFT JOIN users u ON u.id=p.recorded_by WHERE p.customer_id=? ORDER BY p.created_at DESC, p.id DESC LIMIT 50", c.id);
+    const credits = q("SELECT cr.*, s.code, (SELECT COALESCE(SUM(amount),0) FROM payments WHERE credit_id=cr.id AND status='pending') pending FROM credits cr LEFT JOIN sales s ON s.id=cr.sale_id WHERE cr.customer_id=? ORDER BY cr.borrowed_on DESC, cr.id DESC", c.id).map(creditView);
+    const payments = q("SELECT p.id,p.credit_id,p.customer_id,p.amount,p.method,p.reference,p.reference_last4,p.created_at,p.recorded_by,p.status,p.provider,p.receipt_mime,p.confirmed_at, COALESCE(s.code,'CR-'||cr.id) code, u.name recorded_by_name FROM payments p JOIN credits cr ON cr.id=p.credit_id LEFT JOIN sales s ON s.id=cr.sale_id LEFT JOIN users u ON u.id=p.recorded_by WHERE p.customer_id=? ORDER BY p.created_at DESC, p.id DESC LIMIT 50", c.id);
     const life = one("SELECT COALESCE(SUM(amount),0) borrowed, COALESCE(SUM(paid),0) paid FROM credits WHERE customer_id=? AND status<>'void'", c.id);
     res.json({ customer: custRow(c), credits, payments, lifetime: { borrowed: round2(life.borrowed), paid: round2(life.paid) } });
   });
@@ -380,10 +333,12 @@ function createApp(db, opts = {}) {
   });
 
   // ---------- credit management ----------
-  const payRows = `SELECT p.*, c.name customer_name, COALESCE(s.code,'CR-'||cr.id) code, u.name recorded_by_name FROM payments p JOIN customers c ON c.id=p.customer_id JOIN credits cr ON cr.id=p.credit_id LEFT JOIN sales s ON s.id=cr.sale_id LEFT JOIN users u ON u.id=p.recorded_by`;
+  const payRows = `SELECT p.id,p.credit_id,p.customer_id,p.amount,p.method,p.reference,p.reference_last4,p.created_at,p.recorded_by,p.status,p.provider,p.receipt_mime,p.confirmed_at,
+    c.name customer_name, COALESCE(s.code,'CR-'||cr.id) code, round(cr.amount-cr.paid,2) balance_due, cr.due_date, u.name recorded_by_name
+    FROM payments p JOIN customers c ON c.id=p.customer_id JOIN credits cr ON cr.id=p.credit_id LEFT JOIN sales s ON s.id=cr.sale_id LEFT JOIN users u ON u.id=p.recorded_by`;
   app.get('/api/credits', staff, (req, res) => {
     const st = req.query.status || 'open';
-    let rows = q(`SELECT cr.*, c.name customer_name, COALESCE(s.code,'CR-'||cr.id) code FROM credits cr JOIN customers c ON c.id=cr.customer_id LEFT JOIN sales s ON s.id=cr.sale_id WHERE (?='all' OR cr.status=?) ${req.query.customer_id ? 'AND cr.customer_id=' + (Number(req.query.customer_id) || 0) : ''} ORDER BY cr.due_date, cr.id`, st, st).map(creditView);
+    let rows = q(`SELECT cr.*, c.name customer_name, COALESCE(s.code,'CR-'||cr.id) code, (SELECT COALESCE(SUM(amount),0) FROM payments WHERE credit_id=cr.id AND status='pending') pending FROM credits cr JOIN customers c ON c.id=cr.customer_id LEFT JOIN sales s ON s.id=cr.sale_id WHERE (?='all' OR cr.status=?) ${req.query.customer_id ? 'AND cr.customer_id=' + (Number(req.query.customer_id) || 0) : ''} ORDER BY cr.due_date, cr.id`, st, st).map(creditView);
     const open = q("SELECT * FROM credits WHERE status='open'").map(creditView);
     const sum = { owed: round2(open.reduce((a, c) => a + c.balance, 0)), past_due: round2(open.filter(c => c.state === 'overdue').reduce((a, c) => a + c.balance, 0)), past_due_customers: new Set(open.filter(c => c.state === 'overdue').map(c => c.customer_id)).size,
       customers: new Set(open.map(c => c.customer_id)).size, due_7: round2(open.filter(c => c.days_left >= 0 && c.days_left <= 7).reduce((a, c) => a + c.balance, 0)),
@@ -419,18 +374,31 @@ function createApp(db, opts = {}) {
   app.get('/api/payments', staff, (req, res) => {
     const st = req.query.status; res.json(q(`${payRows} WHERE (?='' OR p.status=?) ORDER BY p.created_at DESC, p.id DESC LIMIT 100`, st || '', st || ''));
   });
+  app.get('/api/payments/proofs', admin, (req, res) => {
+    res.json(q(`${payRows} WHERE p.status='pending' AND p.provider='manual_qr' ORDER BY p.created_at, p.id`));
+  });
+  app.get('/api/payments/:id/receipt', admin, (req, res) => {
+    const proof = one("SELECT receipt_image,receipt_mime FROM payments WHERE id=? AND provider='manual_qr'", req.params.id);
+    if (!proof || !proof.receipt_image || !proof.receipt_mime) throw new HttpError(404, 'Receipt image not found');
+    res.set('Cache-Control', 'private, no-store');
+    res.type(proof.receipt_mime).send(proof.receipt_image);
+  });
   function decidePayment(req, ok) {
-    const p = one('SELECT * FROM payments WHERE id=?', req.params.id); if (!p) throw new HttpError(404, 'Payment not found'); if (p.status !== 'pending') throw bad('This payment was already handled');
-    if (p.provider === 'paymongo') throw bad('PayMongo payments are confirmed automatically after the gateway verifies them');
-    db.transaction(() => {
+    return db.transaction(() => {
+      const p = one('SELECT id,credit_id,customer_id,amount,status,provider FROM payments WHERE id=?', req.params.id);
+      if (!p) throw new HttpError(404, 'Payment not found');
+      if (p.status !== 'pending') throw bad('This payment was already handled');
+      if (p.provider !== 'manual' && req.user.role !== 'admin') throw new HttpError(403, 'Only the admin can verify this payment');
       if (ok) {
-        const c = one('SELECT * FROM credits WHERE id=?', p.credit_id), rem = round2(c.amount - c.paid);
-        if (c.status !== 'open' || p.amount > rem + 0.001) throw bad(`Payment exceeds the remaining balance (₱${rem.toFixed(2)}). Reject it instead.`);
+        const c = one('SELECT * FROM credits WHERE id=?', p.credit_id);
+        if (!c || c.status !== 'open') throw bad('The credit is no longer open. Reject this payment instead.');
+        const rem = round2(c.amount - c.paid);
+        if (p.amount > rem + 0.001) throw bad(`Payment exceeds the remaining balance (₱${rem.toFixed(2)}). Reject it instead.`);
         const np = round2(c.paid + p.amount); run('UPDATE credits SET paid=?, status=? WHERE id=?', np, np >= c.amount - 0.001 ? 'paid' : 'open', c.id);
       }
-      run('UPDATE payments SET status=?, recorded_by=? WHERE id=?', ok ? 'confirmed' : 'rejected', req.user.id, p.id);
+      run('UPDATE payments SET status=?, recorded_by=?, confirmed_at=? WHERE id=?', ok ? 'confirmed' : 'rejected', req.user.id, ok ? ymdhms() : null, p.id);
+      return one('SELECT id,credit_id,customer_id,amount,method,reference,reference_last4,created_at,recorded_by,status,provider,receipt_mime,confirmed_at FROM payments WHERE id=?', p.id);
     })();
-    return one('SELECT * FROM payments WHERE id=?', p.id);
   }
   app.post('/api/payments/:id/confirm', staff, (req, res) => res.json(decidePayment(req, true)));
   app.post('/api/payments/:id/reject', staff, (req, res) => res.json(decidePayment(req, false)));
@@ -599,13 +567,13 @@ function createApp(db, opts = {}) {
   // ---------- customer portal ----------
   const me = req => one('SELECT * FROM customers WHERE id=?', req.user.customer_id);
   app.get('/api/portal/summary', customer, (req, res) => {
-    const c = me(req), credits = q("SELECT cr.*, COALESCE(s.code,'CR-'||cr.id) code FROM credits cr LEFT JOIN sales s ON s.id=cr.sale_id WHERE cr.customer_id=? AND cr.status<>'void' ORDER BY cr.borrowed_on DESC, cr.id DESC", c.id).map(creditView);
+    const c = me(req), credits = q("SELECT cr.*, COALESCE(s.code,'CR-'||cr.id) code, (SELECT COALESCE(SUM(amount),0) FROM payments WHERE credit_id=cr.id AND status='pending') pending FROM credits cr LEFT JOIN sales s ON s.id=cr.sale_id WHERE cr.customer_id=? AND cr.status<>'void' ORDER BY cr.borrowed_on DESC, cr.id DESC", c.id).map(creditView);
     const open = credits.filter(x => x.status === 'open'), owed = round2(open.reduce((a, x) => a + x.balance, 0)), pend = q("SELECT credit_id, SUM(amount) v FROM payments WHERE customer_id=? AND status='pending' GROUP BY credit_id", c.id);
     const notes = [];
     open.filter(x => x.state === 'overdue').forEach(x => notes.push({ icon: '⚠', title: 'Payment overdue', text: `${x.code} · ₱${x.balance.toFixed(2)} was due ${x.due_date}`, kind: 'overdue' }));
     open.filter(x => x.state === 'due_soon').forEach(x => notes.push({ icon: '⏰', title: 'Payment due soon', text: `${x.code} · ₱${x.balance.toFixed(2)} due ${x.due_date}`, kind: 'due' }));
     q("SELECT * FROM credit_requests WHERE customer_id=? AND status<>'pending' AND date(decided_at)>=? ORDER BY decided_at DESC", c.id, ymd(addDays(new Date(), -14))).forEach(r => notes.push({ icon: r.status === 'approved' ? '✅' : '✖', title: `Credit request ${r.status}`, text: `Your request for ₱${r.amount.toFixed(2)} was ${r.status}. ${r.owner_note || ''}`.trim(), kind: r.status }));
-    q("SELECT p.*, COALESCE(s.code,'CR-'||p.credit_id) code FROM payments p JOIN credits cr ON cr.id=p.credit_id LEFT JOIN sales s ON s.id=cr.sale_id WHERE p.customer_id=? AND p.status='pending'", c.id).forEach(p => notes.push({ icon: '⏳', title: 'Payment awaiting confirmation', text: `₱${p.amount.toFixed(2)} for ${p.code} will be verified by the store`, kind: 'pending' }));
+    q("SELECT p.amount,p.credit_id,p.provider, COALESCE(s.code,'CR-'||p.credit_id) code FROM payments p JOIN credits cr ON cr.id=p.credit_id LEFT JOIN sales s ON s.id=cr.sale_id WHERE p.customer_id=? AND p.status='pending'", c.id).forEach(p => notes.push({ icon: '⏳', title: p.provider === 'manual_qr' ? 'Payment proof awaiting verification' : 'Payment awaiting confirmation', text: `₱${p.amount.toFixed(2)} for ${p.code} will be verified by the store`, kind: 'pending' }));
     const next = open.slice().sort((a, b) => a.due_date.localeCompare(b.due_date))[0];
     res.json({ customer: { id: c.id, name: c.name, phone: c.phone }, credit_limit: c.credit_limit, outstanding: owed, available: round2(Math.max(0, c.credit_limit - owed)), next_due: next ? next.due_date : null, next_due_days: next ? next.days_left : null,
       status: open.some(x => x.state === 'overdue') ? 'overdue' : owed > 0 ? 'pending' : 'good', open, pending: pend, notifications: notes,
@@ -640,64 +608,23 @@ function createApp(db, opts = {}) {
     const c = me(req), rows = q(`${payRows} WHERE p.customer_id=? ORDER BY p.created_at DESC, p.id DESC LIMIT 100`, c.id);
     res.json({ total_paid: round2(rows.filter(r => r.status === 'confirmed').reduce((a, r) => a + r.amount, 0)), items: rows });
   });
-  app.post('/api/portal/pay', customer, async (req, res) => {
-    const c = me(req), method = req.body.method; if (!['cash', 'ewallet'].includes(method)) throw bad('Choose a payment method');
-    const cr = one("SELECT * FROM credits WHERE id=? AND customer_id=? AND status='open'", Number(req.body.credit_id) || 0, c.id); if (!cr) throw bad('Choose which utang you want to pay');
-    const pend = one("SELECT COALESCE(SUM(amount),0) v FROM payments WHERE credit_id=? AND status='pending'", cr.id).v, rem = round2(cr.amount - cr.paid - pend);
-    const amount = round2(num(req.body.amount, 'Amount', { min: 0.01 })); if (amount > rem + 0.001) throw bad(`Amount is more than what you still owe (₱${Math.max(0, rem).toFixed(2)})`);
-    if (method === 'cash') return res.json({ ok: true, message: 'Please pay this amount in cash at the store counter. The cashier will record it.' });
-    if (paymongoConfigured) {
-      const gatewayMethod = req.body.gateway_method;
-      if (!['gcash', 'qrph'].includes(gatewayMethod)) throw bad('Choose GCash app or QR Ph');
-      if (!publicUrl) throw new HttpError(503, 'Set PUBLIC_URL before enabling online payments');
-      const id = db.transaction(() => {
-        const remainingPending = one("SELECT COALESCE(SUM(amount),0) v FROM payments WHERE credit_id=? AND status='pending'", cr.id).v;
-        const currentCredit = one("SELECT * FROM credits WHERE id=? AND customer_id=? AND status='open'", cr.id, c.id);
-        const currentRemaining = currentCredit ? round2(currentCredit.amount - currentCredit.paid - remainingPending) : 0;
-        if (!currentCredit || amount > currentRemaining + 0.001) throw bad(`Amount is more than what you still owe (₱${Math.max(0, currentRemaining).toFixed(2)})`);
-        return run("INSERT INTO payments(credit_id,customer_id,amount,method,reference,created_at,status,provider,paymongo_method_type) VALUES(?,?,?,?,?,?,'pending','paymongo',?)",
-          cr.id, c.id, amount, 'ewallet', 'PayMongo checkout', ymdhms(), gatewayMethod).lastInsertRowid;
-      })();
-      const referenceNumber = `KK-PAY-${id}`;
-      const rootUrl = publicUrl.replace(/\/+$/, '');
-      let checkout;
-      try {
-        const response = await fetcher('https://api.paymongo.com/v2/checkout_sessions', {
-          method: 'POST',
-          signal: AbortSignal.timeout(15000),
-          headers: {
-            Authorization: `Basic ${Buffer.from(`${paymongoSecretKey}:`).toString('base64')}`,
-            'Content-Type': 'application/json',
-            'Idempotency-Key': referenceNumber,
-          },
-          body: JSON.stringify({ data: { attributes: {
-            line_items: [{ name: `Kita Kita credit payment ${cr.id}`, amount: Math.round(amount * 100), currency: 'PHP', quantity: 1 }],
-            payment_method_types: [gatewayMethod],
-            success_url: `${rootUrl}/#/payment?credit_id=${cr.id}&payment=returned`,
-            cancel_url: `${rootUrl}/#/payment?credit_id=${cr.id}&payment=cancelled`,
-            reference_number: referenceNumber,
-            metadata: { payment_id: String(id), customer_id: String(c.id), credit_id: String(cr.id) },
-          } } }),
-        });
-        const result = await response.json();
-        const checkoutUrl = result.data?.attributes?.checkout_url;
-        if (!response.ok || !result.data?.id || typeof checkoutUrl !== 'string' || new URL(checkoutUrl).origin !== 'https://checkout.paymongo.com') {
-          const error = new Error('PayMongo rejected the checkout request');
-          error.status = response.status;
-          throw error;
-        }
-        checkout = { id: result.data.id, url: checkoutUrl };
-        run('UPDATE payments SET paymongo_checkout_session_id=?, paymongo_checkout_url=? WHERE id=? AND status=\'pending\'', checkout.id, checkout.url, id);
-      } catch (error) {
-        run("DELETE FROM payments WHERE id=? AND status='pending' AND paymongo_checkout_session_id IS NULL", id);
-        console.error('PayMongo checkout request failed:', error.status || error.message);
-        throw new HttpError(502, 'Unable to start GCash checkout right now. Please try again.');
-      }
-      return res.status(201).json({ ok: true, message: 'Continue to PayMongo to pay with GCash.', checkout_url: checkout.url, payment: one('SELECT * FROM payments WHERE id=?', id) });
-    }
-    const ref = str(req.body.reference, 60); if (ref.length < 4) throw bad('Enter your e-wallet reference number');
-    const id = run("INSERT INTO payments(credit_id,customer_id,amount,method,reference,created_at,status) VALUES(?,?,?,?,?,?,'pending')", cr.id, c.id, amount, 'ewallet', ref, ymdhms()).lastInsertRowid;
-    res.status(201).json({ ok: true, message: 'Payment submitted. The store will verify it and update your balance.', payment: one('SELECT * FROM payments WHERE id=?', id) });
+  app.post('/api/portal/payment-proofs', customer, (req, res) => {
+    const c = me(req), creditId = num(req.body.credit_id, 'Credit', { int: true, min: 1 });
+    const amount = round2(num(req.body.amount, 'Amount', { min: 0.01, max: 1e6 }));
+    const last4 = req.body.reference_last4;
+    if (typeof last4 !== 'string' || !/^\d{4}$/.test(last4)) throw bad('Enter exactly the last 4 digits of the reference number');
+    const { image, mime } = parseReceiptImage(req.body.receipt_image);
+    const id = db.transaction(() => {
+      const cr = one("SELECT * FROM credits WHERE id=? AND customer_id=? AND status='open'", creditId, c.id);
+      if (!cr) throw bad('Choose an open utang to pay');
+      const pending = one("SELECT COALESCE(SUM(amount),0) v FROM payments WHERE credit_id=? AND status='pending'", cr.id).v;
+      const remaining = round2(cr.amount - cr.paid - pending);
+      if (amount > remaining + 0.001) throw bad(`Amount is more than what you still owe (₱${Math.max(0, remaining).toFixed(2)})`);
+      return run("INSERT INTO payments(credit_id,customer_id,amount,method,reference,reference_last4,receipt_mime,receipt_image,created_at,status,provider) VALUES(?,?,?,?,?,?,?,?,?,'pending','manual_qr')",
+        cr.id, c.id, amount, 'ewallet', last4, last4, mime, image, ymdhms()).lastInsertRowid;
+    })();
+    const payment = one('SELECT id,credit_id,amount,reference_last4,created_at,status,provider FROM payments WHERE id=?', id);
+    res.status(201).json({ ok: true, message: 'Payment proof submitted. Pending verification by the store.', payment });
   });
 
   // ---------- static + errors ----------

@@ -38,9 +38,7 @@ CREATE TABLE IF NOT EXISTS payments(
   id INTEGER PRIMARY KEY AUTOINCREMENT, credit_id INTEGER NOT NULL REFERENCES credits(id), customer_id INTEGER NOT NULL REFERENCES customers(id),
   amount REAL NOT NULL CHECK(amount>0), method TEXT NOT NULL, reference TEXT DEFAULT '', created_at TEXT NOT NULL,
   recorded_by INTEGER REFERENCES users(id), status TEXT NOT NULL DEFAULT 'confirmed' CHECK(status IN ('confirmed','pending','rejected')),
-  provider TEXT NOT NULL DEFAULT 'manual', paymongo_checkout_session_id TEXT, paymongo_checkout_url TEXT, paymongo_method_type TEXT);
-CREATE TABLE IF NOT EXISTS paymongo_webhook_events(
-  event_id TEXT PRIMARY KEY, received_at TEXT NOT NULL);
+  provider TEXT NOT NULL DEFAULT 'manual', reference_last4 TEXT, receipt_mime TEXT, receipt_image BLOB, confirmed_at TEXT);
 CREATE TABLE IF NOT EXISTS credit_requests(
   id INTEGER PRIMARY KEY AUTOINCREMENT, customer_id INTEGER NOT NULL REFERENCES customers(id), items TEXT NOT NULL,
   amount REAL NOT NULL, preferred_due TEXT NOT NULL, note TEXT DEFAULT '', status TEXT NOT NULL DEFAULT 'pending'
@@ -65,11 +63,16 @@ function open(file) {
   db.pragma('foreign_keys = ON');
   db.exec(SCHEMA);
   const paymentColumns = new Set(db.pragma('table_info(payments)').map(column => column.name));
-  if (!paymentColumns.has('provider')) db.exec("ALTER TABLE payments ADD COLUMN provider TEXT NOT NULL DEFAULT 'manual'");
-  if (!paymentColumns.has('paymongo_checkout_session_id')) db.exec('ALTER TABLE payments ADD COLUMN paymongo_checkout_session_id TEXT');
-  if (!paymentColumns.has('paymongo_checkout_url')) db.exec('ALTER TABLE payments ADD COLUMN paymongo_checkout_url TEXT');
-  if (!paymentColumns.has('paymongo_method_type')) db.exec('ALTER TABLE payments ADD COLUMN paymongo_method_type TEXT');
-  db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_payments_paymongo_session ON payments(paymongo_checkout_session_id) WHERE paymongo_checkout_session_id IS NOT NULL');
+  for (const [column, definition] of [
+    ['provider', "TEXT NOT NULL DEFAULT 'manual'"],
+    ['reference_last4', 'TEXT'],
+    ['receipt_mime', 'TEXT'],
+    ['receipt_image', 'BLOB'],
+    ['confirmed_at', 'TEXT'],
+  ]) {
+    if (!paymentColumns.has(column)) db.exec(`ALTER TABLE payments ADD COLUMN ${column} ${definition}`);
+  }
+  db.exec('CREATE INDEX IF NOT EXISTS idx_payments_pending_provider ON payments(status,provider,created_at)');
   return db;
 }
 

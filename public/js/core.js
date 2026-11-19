@@ -1,7 +1,7 @@
 'use strict';
 /* Kita Kita front end — core: helpers, API client, UI kit, charts, auth screens, layout & router */
 (function () {
-  const KK = window.KK = { S: { token: null, user: null, cfg: { setup_required: false, payment_gateway: false, store: { name: 'Kita Kita Store', address: '', phone: '' } }, alerts: null, rt: 0 }, staffRoutes: {}, portalRoutes: {} };
+  const KK = window.KK = { S: { token: null, user: null, cfg: { setup_required: false, store: { name: 'Kita Kita Store', address: '', phone: '' } }, alerts: null, rt: 0 }, staffRoutes: {}, portalRoutes: {} };
   const S = KK.S;
   try { S.token = localStorage.getItem('kk_token'); } catch (e) { /* storage blocked */ }
 
@@ -152,7 +152,7 @@
     });
   };
   KK.customerLogin = () => {
-    $('#app').innerHTML = `<div class="auth"><div class="hero cu"><div class="logo" style="font-size:26px;margin:0"><b>K</b>Kita Kita</div><div style="color:#fde68a;font-weight:700;letter-spacing:.1em;font-size:12px;margin-top:40px">CUSTOMER PORTAL</div><h1 style="margin-top:8px">Tingnan ang utang mo<br>anumang oras.</h1><p style="color:#dbeafe">Check your balance, due dates, purchases and payments from your phone — no need to ask at the store.</p>${heroLi(['See available products and prices', 'Personal credit balance &amp; payment deadlines', 'Request to buy on credit', 'Pay by cash or e-wallet, view payment history'])}</div>
+    $('#app').innerHTML = `<div class="auth"><div class="hero cu"><div class="logo" style="font-size:26px;margin:0"><b>K</b>Kita Kita</div><div style="color:#fde68a;font-weight:700;letter-spacing:.1em;font-size:12px;margin-top:40px">CUSTOMER PORTAL</div><h1 style="margin-top:8px">Tingnan ang utang mo<br>anumang oras.</h1><p style="color:#dbeafe">Check your balance, due dates, purchases and payments from your phone — no need to ask at the store.</p>${heroLi(['See available products and prices', 'Personal credit balance &amp; payment deadlines', 'Request to buy on credit', 'Submit GCash QR proof or pay by cash'])}</div>
     <div class="form"><div class="box"><h2 id="ct">Customer Login</h2><p class="mu" style="margin:4px 0 12px">Log in to view your account</p><div class="tabs" style="width:100%"><button class="on" data-m="in" style="flex:1">Log in</button><button data-m="up" style="flex:1">Create account</button></div>
     <form id="cf" novalidate>${KK.field('Mobile number or email', 'identifier', '', { req: true, ac: 'username' })}${KK.field('Password', 'password', '', { type: 'password', req: true, ac: 'current-password' })}<button class="btn g block" type="submit" style="margin-top:18px;padding:12px">Log in</button></form>
     <form id="rf" novalidate hidden>${KK.field('Full name', 'name', '', { req: true, ac: 'name' })}${KK.field('Mobile number', 'phone', '', { req: true, type: 'tel', ac: 'tel' })}${KK.field('Email (optional)', 'email', '', { type: 'email', ac: 'email' })}${KK.field('Create password (min. 6 characters)', 'password', '', { type: 'password', req: true, ac: 'new-password' })}<button class="btn block" type="submit" style="margin-top:18px;padding:12px">Register</button><p class="tag" style="margin-top:8px">New accounts start with no credit. The owner sets your credit limit. If the store already has your number, ask the owner to create your login.</p></form>
@@ -173,6 +173,46 @@
   };
 
   /* ---------- layout & router ---------- */
+  const profileMenu = u => `<div class="profile-control"><button class="profile-trigger" type="button" data-profile-toggle aria-label="Open account menu for ${esc(u.name)}" aria-haspopup="true" aria-expanded="false" aria-controls="profile-menu">
+    <span class="profile-avatar">${esc(KK.initials(u.name))}</span><span class="profile-chevron" aria-hidden="true">v</span></button>
+    <div class="profile-menu" id="profile-menu" hidden><div class="profile-card"><div class="profile-avatar">${esc(KK.initials(u.name))}</div><b>${esc(u.name)}</b></div>
+    <div class="profile-items" role="menu" aria-label="Account actions"><button class="profile-item" type="button" role="menuitem" data-profile-action="password"><span class="profile-item-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4.5" y="10.5" width="15" height="10" rx="2"/><path d="M8 10.5V7a4 4 0 0 1 8 0v3.5"/><circle cx="12" cy="15.5" r="1"/></svg></span><span>Change Password</span></button>
+    <button class="profile-item" type="button" role="menuitem" data-profile-action="logout"><span class="profile-item-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M13 4H5v16h8"/><path d="M10 12h10m-4-4 4 4-4 4"/><path d="M13 4v4"/></svg></span><span>Log out</span></button></div></div></div>`;
+  const closeProfileMenus = returnFocus => {
+    KK.$$('.profile-menu:not([hidden])').forEach(menu => {
+      menu.hidden = true;
+      const trigger = $('[data-profile-toggle]', menu.parentElement);
+      if (trigger) { trigger.setAttribute('aria-expanded', 'false'); if (returnFocus) trigger.focus(); }
+    });
+  };
+  document.addEventListener('pointerdown', e => {
+    if (!e.target.closest('.profile-control')) closeProfileMenus(false);
+  });
+  document.addEventListener('click', e => {
+    const trigger = e.target.closest('[data-profile-toggle]');
+    if (trigger) {
+      const menu = document.getElementById(trigger.getAttribute('aria-controls')), open = menu.hidden;
+      closeProfileMenus(false); menu.hidden = !open; trigger.setAttribute('aria-expanded', String(open));
+      if (open) $('[role="menuitem"]', menu).focus();
+      return;
+    }
+    const action = e.target.closest('[data-profile-action]');
+    if (!action) return;
+    closeProfileMenus(false);
+    if (action.dataset.profileAction === 'password') KK.changePassword();
+    else if (action.dataset.profileAction === 'logout') KK.logout();
+  });
+  document.addEventListener('keydown', e => {
+    const menu = $('.profile-menu:not([hidden])');
+    if (!menu) return;
+    if (e.key === 'Escape') { e.preventDefault(); closeProfileMenus(true); return; }
+    const items = KK.$$('[role="menuitem"]', menu), current = items.indexOf(document.activeElement);
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault(); items[(current + (e.key === 'ArrowDown' ? 1 : items.length - 1)) % items.length].focus();
+    } else if (e.key === 'Home' || e.key === 'End') {
+      e.preventDefault(); items[e.key === 'Home' ? 0 : items.length - 1].focus();
+    }
+  });
   const STAFF_NAV = [['dashboard', '◧', 'Dashboard', ['admin']], ['insights', '✦', 'Insights', ['admin']], ['pos', '⌗', 'POS / Checkout', ['admin', 'cashier']], ['inventory', '▤', 'Inventory', ['admin', 'cashier']], ['customers', '☺', 'Customers', ['admin', 'cashier']],
     ['credit', '₱', 'Credit (Utang)', ['admin', 'cashier']], ['transactions', '⇄', 'Transactions', ['admin', 'cashier']], ['reports', '▥', 'Reports', ['admin']], ['expenses', '⚑', 'Expenses', ['admin']], ['users', '⚙', 'Users', ['admin']]];
   const PORTAL_NAV = [['dashboard', 'Dashboard'], ['products', 'Products'], ['credit', 'My Credit'], ['requests', 'Credit Requests'], ['history', 'Purchase History'], ['payments', 'Payments']];
@@ -183,25 +223,24 @@
     set('inventory', a.low + a.out); set('credit', a.pending_requests + a.pending_payments + a.overdue); const bell = $('#bell'); if (bell) bell.textContent = '🔔 ' + (a.low + a.out + a.near_expiry + a.overdue + a.pending_requests + a.pending_payments);
   };
   KK.showAlerts = () => {
-    const a = S.alerts || {}, it = [[a.out, 'Out of stock', 'inventory?status=out'], [a.low, 'Low stock items', 'inventory?status=low'], [a.near_expiry, 'Near-expiry items', 'inventory?status=near_expiry'], [a.overdue, 'Customers with overdue utang', 'credit'], [a.pending_requests, 'Pending credit requests', 'credit?tab=requests'], [a.pending_payments, 'E-wallet payments to confirm', 'credit?tab=payments']].filter(x => x[0] > 0);
+    const a = S.alerts || {}, it = [[a.out, 'Out of stock', 'inventory?status=out'], [a.low, 'Low stock items', 'inventory?status=low'], [a.near_expiry, 'Near-expiry items', 'inventory?status=near_expiry'], [a.overdue, 'Customers with overdue utang', 'credit'], [a.pending_requests, 'Pending credit requests', 'credit?tab=requests'], [a.pending_payments, 'Payments pending verification', 'credit?tab=payments']].filter(x => x[0] > 0);
     const m = KK.modal('Alerts', it.length ? it.map(x => `<div class="li"><span><b>${x[0]}</b> ${x[1]}</span><button class="btn s o" data-go="${x[2]}">View</button></div>`).join('') : '<div class="empty">All good! No alerts right now. 🎉</div>');
     KK.$$('[data-go]', m).forEach(b => b.onclick = () => { m.remove(); KK.go(b.dataset.go); });
   };
   const shellStaff = () => {
     const u = S.user, nav = STAFF_NAV.filter(n => n[3].includes(u.role));
     $('#app').innerHTML = `<div class="shell" data-shell="staff"><aside class="side" id="side"><div class="logo"><b>K</b>Kita Kita</div>${nav.map(n => `<button class="nav" data-nav="${n[0]}"><i>${n[1]}</i>${n[2]}</button>`).join('')}
-    <div class="sidefoot"><div class="me"><div class="av">${esc(KK.initials(u.name))}</div><div><div style="color:#fff;font-weight:700">${esc(u.name)}</div><div class="tag" style="color:#bbf7d0">${u.role === 'admin' ? 'Owner / Admin' : 'Cashier'}</div></div></div>
-    <button class="nav" id="pwbtn"><i>🔑</i>Change password</button><button class="nav" id="outbtn"><i>⎋</i>Log out</button></div></aside>
-    <div class="main"><header class="top"><button class="burger" id="burger" aria-label="Menu">☰</button><div><h1 id="ttl"></h1><p id="sub"></p></div><div class="sp"><span class="chip hide-sm" id="clock"></span><button class="chip" id="bell" aria-label="Alerts">🔔</button></div></header><div id="viewbox"></div></div></div>`;
+    </aside>
+    <div class="main"><header class="top"><button class="burger" id="burger" aria-label="Menu">☰</button><div><h1 id="ttl"></h1><p id="sub"></p></div><div class="sp"><span class="chip hide-sm" id="clock"></span><button class="chip" id="bell" aria-label="Alerts">🔔</button>${profileMenu(u)}</div></header><div id="viewbox"></div></div></div>`;
     KK.$$('[data-nav]').forEach(b => b.onclick = () => { $('#side').classList.remove('open'); KK.go(b.dataset.nav); });
-    $('#outbtn').onclick = () => KK.logout(); $('#pwbtn').onclick = KK.changePassword; $('#bell').onclick = KK.showAlerts; $('#burger').onclick = () => $('#side').classList.toggle('open');
+    $('#bell').onclick = KK.showAlerts; $('#burger').onclick = () => $('#side').classList.toggle('open');
     const tick = () => { const c = $('#clock'); if (!c) return clearInterval(S.clock); const d = new Date(); c.textContent = d.toLocaleDateString('en-PH', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' }) + ' · ' + d.toLocaleTimeString('en-PH', { hour: 'numeric', minute: '2-digit' }); };
     tick(); clearInterval(S.clock); S.clock = setInterval(tick, 30000);
   };
   const shellPortal = () => {
     const u = S.user;
-    $('#app').innerHTML = `<div data-shell="portal"><nav class="ctop"><div class="logo"><b>K</b>Kita Kita</div>${PORTAL_NAV.map(n => `<button class="t" data-nav="${n[0]}">${n[1]}</button>`).join('')}<div class="who"><div class="av">${esc(KK.initials(u.name))}</div><span class="hide-sm">${esc(u.name)}</span><button class="btn s o" id="pwbtn">Password</button><button class="btn s" id="outbtn">Log out</button></div></nav><div id="viewbox"></div></div>`;
-    KK.$$('[data-nav]').forEach(b => b.onclick = () => KK.go(b.dataset.nav)); $('#outbtn').onclick = () => KK.logout(); $('#pwbtn').onclick = KK.changePassword;
+    $('#app').innerHTML = `<div data-shell="portal"><nav class="ctop"><div class="logo"><b>K</b>Kita Kita</div>${PORTAL_NAV.map(n => `<button class="t" data-nav="${n[0]}">${n[1]}</button>`).join('')}${profileMenu(u)}</nav><div id="viewbox"></div></div>`;
+    KK.$$('[data-nav]').forEach(b => b.onclick = () => KK.go(b.dataset.nav));
   };
   KK.route = async () => {
     const h = location.hash.replace(/^#\/?/, ''), [pathq, ...rest] = h.split('/'), [path, query = ''] = pathq.split('?'), args = rest, params = new URLSearchParams(query);
