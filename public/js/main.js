@@ -1,0 +1,2 @@
+'use strict';
+KK.init();
